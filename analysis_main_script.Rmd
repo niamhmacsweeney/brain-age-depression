@@ -1,0 +1,2182 @@
+---
+title: "analysis_main_script"
+author: "Niamh MacSweeney"
+date: '2023-10-19'
+output: html_document
+---
+## Introduction
+
+This script  runs all of the the data cleaning, descriptive statistics, and main analysis (univariate latent change score models) for the project by N MacSweeney, D Beck et al. on multimodal brain age and the emergence of depression in early adolescence. 
+
+This is the main script needed for the analysis and should be navigated using the Outline headings available in this RMarkdown. 
+
+Required inputs:
+- tabuluated ABCD data (release 5.0) from TSD (secure computer server at the University of Oslo 
+- brain age gap estimates derived by D. Beck
+
+
+```{r set up, echo = FALSE}
+
+knitr::opts_chunk$set(fig.width=16, fig.height=10)
+
+
+#load required packages
+library(tidyverse)
+library(viridis)
+library(hrbrthemes)
+library(stringr)
+library(geomtextpath) #density plot labels
+library(DT) #interactive table
+library(ggrain)
+library(gtsummary)
+library(nlme)
+library(ggridges) #for rain cloud plots 
+library(lmerTest)
+library(lavaan) #for LCS
+library(tidySEM) #plotting lavaan output 
+library(reshape2) #for LCS
+library(gridExtra)# for plots
+library(patchwork) #for combining plots
+library(cowplot)
+
+
+
+setwd("/ess/p33/cluster/users/niamhma/brain_age/analysis")
+
+```
+
+###Load data
+
+Note: the files derived by D. Beck already contain age and sex variables, and the models account for relatedness (see manuscript for full description of how relatedness in sample was handled)
+```{r load data}
+
+# T1 brain age
+load("../data/T1_brainage_df_combat_final.rds")
+
+# DTI brain age
+load("../data/DTI_brainage_df_combat_final.rds")  
+
+#Functional brain age
+load("../data/fMRI_brainage_df_combat_final.rds")
+
+#Depression
+#Brief Problem Monitor
+BPM <- read.csv("../../../../groups/imaging/abcd/pheno/ABCDStudyNDA_5.0/core/mental-health/mh_y_bpm.csv")
+
+#Pubertal Developmental Scale (parent report)
+PDS <- read.csv("../../../../groups/imaging/abcd/pheno/ABCDStudyNDA_5.0/core/physical-health/ph_p_pds.csv")
+
+#Demographic variables, including sex 
+demo <- read.csv("../../../../groups/imaging/abcd/pheno/ABCDStudyNDA_5.0/core/abcd-general/abcd_p_demo.csv")
+
+#General participant info incl. site, age, visit type
+gen <- read.csv("../../../../groups/imaging/abcd/pheno/ABCDStudyNDA_5.0/core/abcd-general/abcd_y_lt.csv")
+
+#physical data 
+phys <- read.csv("../../../../groups/imaging/abcd/pheno/ABCDStudyNDA_5.0/core/physical-health/ph_y_anthro.csv")
+
+```
+
+###Inspect data
+```{r inspect data}
+
+uniqueIDs <- unique(T1_brainage$ID)
+test <-table(T1_brainage$ID, T1_brainage$TP)
+
+
+```
+
+
+###Tidy data 
+
+####Brain Age
+```{r rename variables}
+#variables in df have spaces so need to remove
+T1_brainage <- T1_brainage %>% 
+  dplyr::rename(T1_predicted_age = "T1 Predicted Age",
+                T1_chronological_age = "T1 Chronological Age",
+                T1_BAG = "T1 BAG",
+                T1_cPredicted_age = "T1 cPredicted Age",
+                T1_cBAG = "T1 cBAG")
+
+#make new time variable so it is consistent across variables 
+T1_brainage <-  T1_brainage %>% 
+  dplyr::mutate(`time` = dplyr::recode(`TP`,
+                                `1`="T1",
+                                `2`="T3"))
+
+DTI_brainage <- DTI_brainage %>% 
+  dplyr::rename(DTI_predicted_age = "DTI Predicted Age",
+                DTI_chronological_age = "DTI Chronological Age",
+                DTI_BAG = "DTI BAG",
+                DTI_cPredicted_age = "DTI cPredicted Age",
+                DTI_cBAG = "DTI cBAG")
+
+DTI_brainage <-  DTI_brainage %>% 
+  dplyr::mutate(`time` = dplyr::recode(`TP`,
+                                `1`="T1",
+                                `2`="T3"))
+
+
+fMRI_brainage <- fMRI_brainage %>% 
+  dplyr::rename(fMRI_predicted_age = "fMRI Predicted Age",
+                fMRI_chronological_age = "fMRI Chronological Age",
+                fMRI_BAG = "fMRI BAG",
+                fMRI_cPredicted_age = "fMRI cPredicted Age",
+                fMRI_cBAG = "fMRI cBAG")
+
+fMRI_brainage <-  fMRI_brainage %>% 
+  dplyr::mutate(`time` = dplyr::recode(`TP`,
+                                `1`="T1",
+                                `2`="T3"))
+
+```
+
+
+####Biological sex
+ABCD removed "sex" variable as a default column in all the csv/Rds files which makes the data cleaning done previously, more difficult. We will use sex assigned at birth as this variable is the most closely related to biological sex.
+
+We will make a dataframe that matches sex assigned at birth to each ID
+```{r sex linking file, echo=FALSE}
+
+sex <- demo %>% 
+  dplyr::group_by(eventname, demo_sex_v2) %>% #only collected at baseline
+  dplyr::count()
+sex
+#males = 6188, #females = 5677, #Inter-sex male = 3 (Total N = 11868) 
+
+sex <- sex %>% 
+  dplyr::filter(demo_sex_v2 != 3)
+
+#make sex-ID linking file 
+sex_id <- demo %>% 
+  dplyr::group_by(src_subject_id) %>% 
+ dplyr::select(src_subject_id, demo_sex_v2, eventname) %>% 
+  as.data.frame() 
+sex_id$demo_sex_v2 = as.factor(sex_id$demo_sex_v2)
+
+#populate the baseline sex info to other timepoints using fill function from dplyr 
+# Replace NAs in sex based on sex when event name = 1 within each id group
+sex_id <- sex_id %>%
+  dplyr::group_by(src_subject_id) %>%
+  fill(demo_sex_v2, .direction = "down")  # Replace NAs with last non-NA value -- this worked!
+
+#remove intersex-male participants (N=3)
+sex_id <- sex_id %>% 
+  dplyr::filter(demo_sex_v2 != 3)
+#for some reason, the variable still says there are three levels in this factor even through we removed these intersex IDs
+#Let us  try and convert to numeric, filter, and then convert back to factor. 
+sex_id$demo_sex_v2 <- as.numeric(sex_id$demo_sex_v2)
+sex_id <- sex_id[sex_id$demo_sex_v2 != 3, ]
+sex_id$demo_sex_v2 <- as.factor(sex_id$demo_sex_v2)
+str(sex_id) #this worked! 
+
+
+#check number of unique ids (should be 11865) -- looks good. 
+uniqueIDs <- unique(sex_id$src_subject_id)
+
+
+#remove eventname before merging with other dataframes
+sex_id <- sex_id %>%
+  dplyr::select(-eventname)
+
+#rename demo_sex_v2 to "sex" to match rest of script.
+sex_id <- sex_id %>% 
+  dplyr::rename(sex = demo_sex_v2,
+                ID = src_subject_id)
+
+#remove duplicate IDs so that we have one row for each participant and their corresponding sex
+sex_id <- dplyr::distinct(sex_id, ID, .keep_all = T)
+
+#change sex column to factor variable and code as M = male (1) and F = female (2)
+sex_id <- sex_id %>% 
+dplyr::mutate(`sex` = dplyr::recode(`sex`,
+                      `1`="M",
+                      `2` = "F"))
+sex_id$sex <- as.factor(sex_id$sex)
+
+
+
+```
+####Age
+
+Convert to years
+
+```{r age}
+#select vars
+age <- gen %>% 
+  select(c(src_subject_id, eventname, site_id_l, interview_age))
+
+#convert age to years
+age <- age %>% 
+  dplyr::mutate(age_years = interview_age/12)
+
+#round to two decimal places
+age$age_years <- round(age$age_years, digits = 2)
+
+#remove age in months col
+age <- age %>% select(- interview_age)
+
+#rename subject id
+age <- age %>%  rename(ID = src_subject_id)
+
+
+
+```
+####BPM
+
+Youth internalising difficulties will be assessed using the youth-report Brief Problem Monitor (BPM; Achenbach, 2009), which examines youth behaviour and symptoms over the past week. We will use the BPM data from 3 year follow up when youth are aged 12-13 years as this is the most complete data release. The youth-report BPM comprises 19 items rated as 0 (“not true”), 1 (“somewhat true”), and 2 (“very true”), which can be grouped into three domains (attention, internalising, and externalising). 
+
+3 year follow up: N = 10336
+3.5 year follow up: 8565 (full data release not yet available)
+
+Given that our outcome measure of interest is mood-related difficulties, we will use the BPM internalising symptoms raw summary score (variable name: bpm_y_scr_internal_r) to quantify youth internalising symptoms. This summary variable is available in the ABCD data field “abcd_yssbpm01” and is the sum of the raw scores for items 9 (“I feel worthless or inferior”), 11 (“I am too fearful or anxious”), 12 (“I feel too guilty”), 13 (“I am self-conscious or easily embarrassed”), 19 (“I am unhappy, sad, or depressed”), and 20 (“I worry a lot”). An internalising summary score is only available for participants that answered all of these associated items.
+
+
+```{r BPM, echo=FALSE}
+
+#select variables of interest
+dep <- BPM %>% 
+  dplyr::select(c(src_subject_id, eventname, bpm_y_scr_internal_r))
+  
+#inspect data per timepoint 
+  dep %>% 
+  dplyr::group_by(eventname) %>% 
+  dplyr::count()
+
+#change column names so consistent with imaging 
+dep <- dep %>% 
+  dplyr::rename(ID = src_subject_id)
+
+#reduce to year 3 BPM only 
+dep <- dep %>% 
+  dplyr::filter(eventname == "3_year_follow_up_y_arm_1") #N =10336
+
+# #remove eventname column before merging with imaging data
+# dep <- dep %>% 
+#   dplyr::select(-eventname)
+
+#rename internalising diff variable
+dep <- dep %>% 
+  dplyr::rename(BPM_Y3 = bpm_y_scr_internal_r)
+               
+                
+#extract 6 month depressive symptoms and then merge with main dep df
+#Reduce BPM to year 1
+
+depEarly <- BPM %>% 
+  dplyr::select(c(src_subject_id, eventname, bpm_y_scr_internal_r))
+
+depEarly <- depEarly %>% 
+  filter(eventname == "6_month_follow_up_arm_1") #N=11389
+
+#remove eventname
+depEarly <- depEarly %>% select(-eventname) 
+
+#rename ID col before merge 
+depEarly <- depEarly %>%
+  rename(ID = src_subject_id,
+         BPM_6m = bpm_y_scr_internal_r)
+
+#merge with main dep dataframe
+dep <- left_join(dep, depEarly, by = "ID")
+
+#merge with age dataframe so that we have the age at which depression was asssessed
+dep <- left_join(dep, age, by = c("ID","eventname")) #this worked
+
+#rename eventname column to time
+#Also rename age_years to age_Y3 to differentiate it from "Age" from the brain age dataframes as this only
+#involves data from baseline and two year follow up 
+dep <- dep %>% 
+  dplyr::rename(time = eventname,
+                age_Y3 = age_years)#renaming 
+
+#remove cols that are no longer needed before later merge 
+dep <- dep %>% 
+  select(-c(time, site_id_l))
+
+
+```
+####PDS
+
+Pubertal development scale (parent report) will be used as measure of perceived physical pubertal development 
+
+```{r PDS tidying}
+#select vars
+PDS <- PDS %>% 
+  dplyr::select(src_subject_id, eventname,
+         pds_1_p, pds_2_p, pds_3_p, pds_m4_p, pds_m5_p, pds_f4_p, pds_f5b_p)
+
+#change any "I don't know/777" or "Refused to Answer/999" to NA
+PDS[PDS == 777] <- NA
+PDS[PDS == 999] <- NA
+
+
+#rename ID column 
+PDS <- PDS %>% 
+  dplyr::rename(ID = src_subject_id)
+
+#merge with sex_id df so we can split PDS     sex to calculate avg and total scores
+PDS <- merge(PDS, sex_id, by = "ID", all.x = TRUE) # 
+
+#merge with age to calculate pubertal timing later 
+
+PDS <- left_join(PDS, age, by = c("ID", "eventname")) #this worked
+```
+
+
+```{r PDS scoring}
+
+#Get average PDS score
+PDS <- PDS %>% 
+  dplyr::mutate(pds_avg = dplyr::case_when
+      (sex == "F" ~ rowMeans(dplyr::select(PDS, c(pds_1_p, pds_2_p, pds_3_p, pds_f4_p, pds_f5b_p))),
+       sex == "M" ~ rowMeans(dplyr::select(PDS, c(pds_1_p, pds_2_p, pds_3_p, pds_m4_p, pds_m5_p))),
+                             TRUE ~ as.integer(NA)))
+
+##Make PDS total score
+PDS <- PDS %>% 
+  dplyr::mutate(pds_tot = dplyr::case_when
+      (sex == "F" ~ rowSums(dplyr::select(PDS, c(pds_1_p, pds_2_p, pds_3_p, pds_f4_p, pds_f5b_p))),
+       sex == "M" ~ rowSums(dplyr::select(PDS, c(pds_1_p, pds_2_p, pds_3_p, pds_m4_p, pds_m5_p))),
+                             TRUE ~ as.integer(NA)))
+
+
+#Make pubertal timing score 
+#remove observations with missing age and pds_avg/pds_tot data 
+PDS <- PDS %>% 
+  dplyr::filter(pds_avg != "NA" & age_years != "NA")
+
+#the variance of site as a random effect is close to zero so we will not include in pt model
+#We need to make separate pt scores for males and females 
+
+#make subject ID factor variable 
+PDS$ID <- as.factor(PDS$ID)
+
+# Fit separate linear models for males and females and extract the residuals
+male_mod <- lmer(pds_avg ~ age_years + (1|ID), data = subset(PDS, sex == "M"))
+summary(male_mod)
+
+female_mod <- lmer(pds_avg ~ age_years + (1|ID), data = subset(PDS, sex == "F"))
+summary(female_mod)
+
+# Create new variables for residuals
+PDS$residuals_males <- NA  # Initialize a variable with NAs
+PDS$residuals_females <- NA  # Initialize a variable with NAs
+
+# Assign residuals to the appropriate rows
+PDS$residuals_males[PDS$sex == "M"] <- residuals(male_mod)
+PDS$residuals_females[PDS$sex == "F"] <- residuals(female_mod)
+
+# Create a combined residual variable
+PDS$residuals_combined <- ifelse(PDS$sex == "M", PDS$residuals_males, PDS$residuals_females) #this worked
+
+#rename var to pt 
+PDS <- PDS %>% 
+  rename(pt = residuals_combined)
+
+```
+
+Plot PDS scores 
+```{r PDS plotting}
+
+#rename baseline response so that timepoints are in correct order when plotting
+PDS$eventname <- str_replace(PDS$eventname, "baseline_year", "0_baseline_year")
+
+#recode eventname responses for ease of plotting
+PDS <- PDS %>%
+dplyr::mutate(`time` = dplyr::recode(`eventname`,
+                                 `0_baseline_year_1_arm_1`="T1",
+                                 `1_year_follow_up_y_arm_1`="T2",
+                                 `2_year_follow_up_y_arm_1`="T3",
+                                 `3_year_follow_up_y_arm_1`="T4",
+                                 `4_year_follow_up_y_arm_1` = "T5"))
+PDS$time <- as.factor(PDS$time)
+
+
+#plot PDS average
+pdsAvgPlot <- ggplot(data=PDS, aes(x=pds_avg, group=sex, fill=sex)) +
+    geom_density(adjust=2, alpha = 0.5, na.rm = TRUE) +
+    facet_wrap(~time) +
+    theme(panel.spacing = unit(0.1, "lines"),
+      axis.ticks.x=element_blank()) +
+  scale_fill_brewer(palette="Dark2") +
+  ylab("") +
+  xlab("Average PDS score")
+pdsAvgPlot
+
+#plot PDS total
+pdsTotPlot <- ggplot(data=PDS, aes(x=pds_tot, group=sex, fill=sex)) +
+    geom_density(adjust=2, alpha = 0.5, na.rm = TRUE) +
+    facet_wrap(~time) +
+    theme(panel.spacing = unit(0.1, "lines"),
+      axis.ticks.x=element_blank()) +
+  scale_fill_brewer(palette="Dark2") +
+  ylab("") +
+  xlab("Total PDS score")
+pdsTotPlot
+```
+
+Reduce dataframe 
+```{r PDS get vars}
+#create df with variables needed for main analysis
+PDSvars <- PDS %>% 
+  select(c(ID, time, pds_avg, pds_tot, pt, site_id_l))
+
+```
+
+####Family ID
+
+Not used in final analysis but interesting to look at relatedness
+```{r demo}
+
+relIDS <- gen %>% 
+  select(src_subject_id, eventname, rel_family_id) %>% 
+  filter(eventname == "baseline_year_1_arm_1") #reduce to baseline
+
+#rename subject id
+relIDS <- relIDS %>% rename(ID = src_subject_id)
+#remove eventname
+relIDS <- relIDS %>% select(-eventname)
+
+
+
+```
+
+
+###Merge data 
+
+We will run separate models for each modality. Therefore, we will merge with puberty and depression variables
+
+```{r merge, echo=FALSE}
+
+T1DF <- left_join(T1_brainage, PDSvars, by = c("ID", "time")) #merge by ID and time 
+T1DF <- left_join(T1DF, dep, by = "ID")
+T1DF <- left_join(T1DF, relIDS, by = "ID")
+
+DTIDF <- left_join(DTI_brainage, PDSvars, by = c("ID", "time")) #merge by ID and time 
+DTIDF <- left_join(DTIDF, dep, by = "ID")
+DTIDF <- left_join(DTIDF, relIDS, by = "ID")
+
+
+fMRIDF <- left_join(fMRI_brainage, PDSvars, by = c("ID", "time")) #merge by ID and time 
+fMRIDF <- left_join(fMRIDF, dep, by = "ID")
+fMRIDF <- left_join(fMRIDF, relIDS, by = "ID")
+
+```
+
+
+```{r scale and convert variables}
+
+#Check that variables are in the correct form. ID and Sex should be factor variables 
+#ID
+T1DF$ID <- as.factor(T1DF$ID)
+DTIDF$ID <- as.factor(DTIDF$ID)
+fMRIDF$ID <- as.factor(fMRIDF$ID)
+
+#Sex 
+T1DF$Sex <- as.factor(T1DF$Sex)
+DTIDF$Sex <- as.factor(DTIDF$Sex)
+fMRIDF$Sex <- as.factor(fMRIDF$Sex)
+
+
+#T1 vars 
+numT1Vars <- c("T1_predicted_age",
+             "T1_chronological_age", "T1_BAG",
+             "T1_cPredicted_age", "T1_cBAG", 
+             "pds_avg", "pds_tot")
+
+T1DFScaled <- T1DF %>%
+  dplyr::mutate(across(all_of(numT1Vars), scale))
+
+
+#DTI vars
+numDTIVars <- c("DTI_predicted_age",
+             "DTI_chronological_age", "DTI_BAG",
+             "DTI_cPredicted_age", "DTI_cBAG",
+             "pds_avg", "pds_tot")
+
+DTIDFScaled <- DTIDF %>%
+  dplyr::mutate(across(all_of(numDTIVars), scale))
+
+#fmRI vars 
+numfMRIVars <- c("Age", "fMRI_predicted_age",
+             "fMRI_chronological_age", "fMRI_BAG",
+             "fMRI_cPredicted_age", "fMRI_cBAG",
+             "pds_avg", "pds_tot")
+
+fMRIDFScaled <- fMRIDF %>%
+  dplyr::mutate(across(all_of(numfMRIVars), scale))
+
+
+```
+
+##Descriptive stats
+
+Make a descriptive stats table for the manuscript and split by sex. We will do this separately for each modality. The tbl_summary function only allows us to group by one variable so we will run the script separately for males and females. 
+
+First, make separate dataframes for males (1) and females (2)
+```{r make sex specific dataframes}
+
+#T1
+T1DFMales <- T1DF %>% 
+  filter(Sex == 1) #N = 5073
+
+T1DFFemales <- T1DF %>% 
+  filter(Sex == 2) #N = 4450
+
+#DTI
+DTIDFMales <- DTIDF %>% 
+  filter(Sex == 1) #N = 4638
+
+DTIDFFemales <- DTIDF %>% 
+  filter(Sex == 2) #N = 4196
+
+#fMRI
+fMRIDFMales <- fMRIDF %>% 
+  filter(Sex == 1) #N = 4187
+
+fMRIDFFemales <- fMRIDF %>% 
+  filter(Sex == 2) #N = 4046
+
+```
+
+
+
+Make tables split by sex
+```{r make sex-specific descriptives table}
+
+#T1
+#males
+TblT1DFMales <- T1DFMales %>% 
+  select(c(TP, Age, T1_cBAG, BPM_Y3, BPM_6m, age_Y3)) %>% 
+  tbl_summary(
+    by = c(TP),
+    statistic = list(
+      all_continuous() ~ c("{mean} ({sd})"),
+      all_categorical() ~ c("{n} / {N} ({p}%)")
+    ),
+    digits = list(
+      all_continuous() ~ c(2, 2, 0, 0),
+      all_categorical() ~ c(0, 0, 1)
+    ),  
+    label = c(
+      TP ~ "Timepoint",
+      Age ~ "Age in year",
+      T1_cBAG ~ " Brain age gap (age-corrected)",
+        BPM_Y3 ~ "Internalising Symptoms (year 3 follow-up)", 
+      BPM_6m ~ "Internalising Symptoms (6 month follow-up)",
+      age_Y3  ~ "Age at Year 3"
+    ),
+    missing_text = "Missing",
+    type = list(all_continuous() ~ "continuous"),
+    missing = "ifany"
+  ) %>% 
+  bold_labels() %>% 
+  italicize_levels()
+TblT1DFMales
+
+#females
+TblT1DFFemales <- T1DFFemales %>% 
+  select(c(TP, Age, T1_cBAG, BPM_Y3, BPM_6m)) %>% 
+  tbl_summary(
+    by = c(TP),
+    statistic = list(
+      all_continuous() ~ c("{mean} ({sd})"),
+      all_categorical() ~ c("{n} / {N} ({p}%)")
+    ),  # <-- Closing parenthesis was missing here
+    digits = list(
+      all_continuous() ~ c(2, 2, 0, 0),
+      all_categorical() ~ c(0, 0, 1)
+    ),  # <-- Corrected the typo
+    label = c(
+      TP ~ "Timepoint",
+      Age ~ "Age in year",
+      T1_cBAG ~ " Brain age gap (age-corrected)",
+        BPM_Y3 ~ "Internalising Symptoms (year 3 follow-up)", 
+      BPM_6m ~ "Internalising Symptoms (6 month follow-up)"
+    ),
+    missing_text = "Missing",
+    type = list(all_continuous() ~ "continuous"),
+    missing = "ifany"
+  ) %>% 
+  bold_labels() %>% 
+  italicize_levels()
+TblT1DFFemales
+
+#DTI
+#males
+TblDTIDFMales <- DTIDFMales %>% 
+  select(c(TP, Age, DTI_cBAG, BPM_Y3, BPM_6m)) %>% 
+  tbl_summary(
+    by = c(TP),
+    statistic = list(
+      all_continuous() ~ c("{mean} ({sd})"),
+      all_categorical() ~ c("{n} / {N} ({p}%)")
+    ),  
+    digits = list(
+      all_continuous() ~ c(2, 2, 0, 0),
+      all_categorical() ~ c(0, 0, 1)
+    ),  
+    label = c(
+      TP ~ "Timepoint",
+      Age ~ "Age in year",
+      DTI_cBAG ~ " Brain age gap (age-corrected)",
+        BPM_Y3 ~ "Internalising Symptoms (year 3 follow-up)", 
+      BPM_6m ~ "Internalising Symptoms (6 month follow-up)"
+    ),
+    missing_text = "Missing",
+    type = list(all_continuous() ~ "continuous"),
+    missing = "ifany"
+  ) %>% 
+  bold_labels() %>% 
+  italicize_levels()
+TblDTIDFMales
+
+#females
+TblDTIDFFemales <- DTIDFFemales %>% 
+  select(c(TP, Age, DTI_cBAG, BPM_Y3, BPM_6m)) %>% 
+  tbl_summary(
+    by = c(TP),
+    statistic = list(
+      all_continuous() ~ c("{mean} ({sd})"),
+      all_categorical() ~ c("{n} / {N} ({p}%)")
+    ),  # 
+    digits = list(
+      all_continuous() ~ c(2, 2, 0, 0),
+      all_categorical() ~ c(0, 0, 1)
+    ),  
+    label = c(
+      TP ~ "Timepoint",
+      Age ~ "Age in year",
+      DTI_cBAG ~ " Brain age gap (age-corrected)",
+        BPM_Y3 ~ "Internalising Symptoms (year 3 follow-up)", 
+      BPM_6m ~ "Internalising Symptoms (6 month follow-up)"
+    ),
+    missing_text = "Missing",
+    type = list(all_continuous() ~ "continuous"),
+    missing = "ifany"
+  ) %>% 
+  bold_labels() %>% 
+  italicize_levels()
+TblDTIDFFemales
+
+#fMRI
+
+#males
+TblfMRIDFMales <- fMRIDFMales %>% 
+  select(c(TP, Age, fMRI_cBAG, BPM_Y3, BPM_6m)) %>% 
+  tbl_summary(
+    by = c(TP),
+    statistic = list(
+      all_continuous() ~ c("{mean} ({sd})"),
+      all_categorical() ~ c("{n} / {N} ({p}%)")
+    ),  
+    digits = list(
+      all_continuous() ~ c(2, 2, 0, 0),
+      all_categorical() ~ c(0, 0, 1)
+    ),  
+    label = c(
+      TP ~ "Timepoint",
+      Age ~ "Age in year",
+      fMRI_cBAG ~ " Brain age gap (age-corrected)",
+        BPM_Y3 ~ "Internalising Symptoms (year 3 follow-up)", 
+      BPM_6m ~ "Internalising Symptoms (6 month follow-up)"
+    ),
+    missing_text = "Missing",
+    type = list(all_continuous() ~ "continuous"),
+    missing = "ifany"
+  ) %>% 
+  bold_labels() %>% 
+  italicize_levels()
+TblfMRIDFMales
+
+#females
+TblfMRIDFFemales <- fMRIDFFemales %>% 
+  select(c(TP, Age, fMRI_cBAG, BPM_Y3, BPM_6m)) %>% 
+  tbl_summary(
+    by = c(TP),
+    statistic = list(
+      all_continuous() ~ c("{mean} ({sd})"),
+      all_categorical() ~ c("{n} / {N} ({p}%)")
+    ),  # 
+    digits = list(
+      all_continuous() ~ c(2, 2, 0, 0),
+      all_categorical() ~ c(0, 0, 1)
+    ),  
+    label = c(
+      TP ~ "Timepoint",
+      Age ~ "Age in year",
+      fMRI_cBAG ~ " Brain age gap (age-corrected)",
+        BPM_Y3 ~ "Internalising Symptoms (year 3 follow-up)", 
+      BPM_6m ~ "Internalising Symptoms (6 month follow-up)"
+    ),
+    missing_text = "Missing",
+    type = list(all_continuous() ~ "continuous"),
+    missing = "ifany"
+  ) %>% 
+  bold_labels() %>% 
+  italicize_levels()
+TblfMRIDFFemales
+
+
+
+
+```
+
+
+#Brain age model figures 
+```{r make figs, fig.width=14, fig.height=6}
+
+library(ggpubr)
+library(taylor) #to have Taylor Swift themed graphs
+
+
+## T1 ##
+#make TP a factor for grouping purposes
+T1DF$TP <- as.factor(T1DF$TP)
+p1 <- ggscatter(T1DF, x = "T1_chronological_age", y = "T1_predicted_age", alpha = 0.4,
+                add = "reg.line", conf.int = TRUE, color = "black",
+                cor.coef = TRUE, cor.method = "pearson", cor.coef.size = 7,
+                xlab = "Age", ylab = "Predicted Age") +
+  geom_point(aes(color = TP), alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, colour = "gray25") +
+  scale_color_manual(values = c("dodgerblue2", "forestgreen"),
+                    labels = c("1" = "Baseline", "2" = "Follow-up")) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text = element_text(size = 16),
+        axis.title = element_text(size = 24, face = "bold"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 16),
+        legend.position = "none") + #remove legend as we will combine plots
+        guides(color = guide_legend(override.aes = list(size = 6))) +
+        labs(title = "T1 model")
+p1
+
+## DTI ##
+
+#make TP a factor
+DTIDF$TP <- as.factor(DTIDF$TP)
+p2 <- ggscatter(DTIDF, x = "DTI_chronological_age", y = "DTI_predicted_age", alpha = 0.4,
+                add = "reg.line", conf.int = TRUE, color = "black",
+                cor.coef = TRUE, cor.method = "pearson", cor.coef.size = 7,
+                xlab = "Age", ylab = "Predicted Age") +
+  geom_point(aes(color = TP), alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, colour = "gray25") +
+  scale_color_manual(values = c("dodgerblue2", "forestgreen"),
+                    labels = c("1" = "Baseline", "2" = "Follow-up")) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text = element_text(size = 16),
+        axis.title = element_text(size = 24, face = "bold"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 16),
+        legend.position = "none") + #remove legend as we will combine plots
+        guides(color = guide_legend(override.aes = list(size = 6))) +
+        labs(title = "DTI model")
+        #keep legend for this fig and make it bigger so that we can use it
+         #for combined fig below 
+p2
+
+
+## fMRI ##
+
+fMRIDF$TP <- as.factor(fMRIDF$TP)
+p3 <- ggscatter(fMRIDF, x = "fMRI_chronological_age", y = "fMRI_predicted_age", alpha = 0.4,
+                add = "reg.line", conf.int = TRUE, color = "black",
+                cor.coef = TRUE, cor.method = "pearson", cor.coef.size = 7,
+                xlab = "Age", ylab = "Predicted Age") +
+  geom_point(aes(color = TP), alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, colour = "gray25") +
+  scale_color_manual(values = c("dodgerblue2", "forestgreen"),
+                    labels = c("1" = "Baseline", "2" = "Follow-up")) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text = element_text(size = 16),
+        axis.title = element_text(size = 24, face = "bold"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 16),
+        legend.position = "right") +
+        guides(color = guide_legend(override.aes = list(size = 6))) +
+        labs(title = "fMRI model")
+        #keep legend for this fig and make it bigger so that we can use it
+         #for combined fig below 
+        
+p3
+
+#Combine the plots
+combined_plot <- grid.arrange(p1, p2, p3, ncol = 3, widths = c(1,1,1.5))
+
+ggsave("../figs/brain_age_predict.png", combined_plot, width = 14, height = 6, units = "in", dpi = 300)
+                                               
+                                                 
+
+```
+
+
+
+#Latent Change Score Models
+
+To examine change in BAG over time, we will use univariate latent change score (ULCS) models following the Kievit et al. tutorial paper: DOI:10.1016/j.dcn.2017.11.007
+
+###Prep dataframes (make wide)
+
+The data needs to be in wide format so we will need to convert our long format dataframes 
+
+```{r convert from long to wide format}
+
+### T1 ###
+T1DFWide <- T1DF %>% 
+  dplyr::select(c(ID, TP, Age, Sex, T1_cBAG, pds_avg, BPM_Y3, BPM_6m)) #select key variables 
+
+
+T1DFWide <- T1DFWide  %>%
+  pivot_wider(
+    names_from = TP, 
+    values_from = c(Age, T1_cBAG, pds_avg)
+              )
+
+### DTI ### 
+
+DTIDFWide <- DTIDF %>% 
+  dplyr::select(c(ID, TP, Age, Sex, DTI_cBAG, pds_avg, BPM_Y3, BPM_6m)) #select key variables 
+
+
+DTIDFWide <- DTIDFWide  %>%
+  pivot_wider(
+    names_from = TP, 
+    values_from = c(Age, DTI_cBAG, pds_avg)
+  )
+summary(DTIDFWide)
+
+### fMRI ### 
+
+fMRIDFWide <- fMRIDF %>% 
+  dplyr::select(c(ID, TP, Age, Sex, fMRI_cBAG, pds_avg, BPM_Y3, BPM_6m)) #select key variables 
+
+
+fMRIDFWide <- fMRIDFWide  %>%
+  pivot_wider(
+    names_from = TP, 
+    values_from = c(Age, fMRI_cBAG, pds_avg)
+  )
+summary(fMRIDFWide)
+
+            
+```
+
+##Run models
+
+We will control for early depressive symptoms (at six months) in our main models. 
+
+####T1 ULCS
+```{r T1 ULCS}
+
+T1_ULCS <-'
+
+T1_cBAG_2 ~ 1*T1_cBAG_1     # Fixed regression of T1_cBAG_2 on T1_cBAG_1
+dBAG_1 =~ 1*T1_cBAG_2       # Defines latent change score factors by fixed regression of dCOG1 on T1_cBAG_2
+T1_cBAG_2 ~ 0*1             # This constrains the intercept of T1_cBAG_2 to 0
+T1_cBAG_2 ~~ 0*T1_cBAG_2    # This fixes the variance of the T1_cBAG_2 to 0 
+
+dBAG_1 ~ 1                  # This estimates the intercept of the change scores 
+T1_cBAG_1 ~  1              # This estimates the intercept of T1_cBAG_1 
+dBAG_1 ~~  dBAG_1           # This estimates the variance of the change scores 
+T1_cBAG_1 ~~ T1_cBAG_1      # This estimates the variance of T1_cBAG_1 
+dBAG_1~~T1_cBAG_1           # This estimates the self-feedback parameter (how BAG_T1 affects dBAG)
+
+
+BPM_Y3 ~ 1                  # This estimates intercept of depression (outcome)
+BPM_6m ~ 1                  # This estimates intercept of early dep
+BPM_Y3 ~ dBAG_1             #change in BAG on depression, controlling for early dep
+BPM_Y3 ~ BPM_6m 
+BPM_Y3 ~ T1_cBAG_1 
+#BPM_Y3 ~ T1_cBAG_2          # regress T1_cBAG_2 on depression
+
+BPM_Y3 ~~ BPM_Y3            # This estimates variance of depression
+BPM_6m ~~ BPM_6m            # This estimates the variance of early dep
+BPM_6m ~~ dBAG_1            # This estimates the variance of early dep and change in BAG
+BPM_6m ~~ T1_cBAG_1         # This estimates the variance of early dep and T1_cBAG_1
+'
+
+fitT1_ULCS <- lavaan(T1_ULCS, data=T1DFWide, estimator='mlr',fixed.x=FALSE, missing='fiml')
+summary(fitT1_ULCS, fit.measures=TRUE, standardized=TRUE, rsquare=TRUE)
+graph_sem(fitT1_ULCS)
+
+
+#Multi-group with sex as grouping variable 
+fitT1_ULCS_group <- lavaan(T1_ULCS, data=T1DFWide, estimator='mlr',fixed.x=FALSE, missing='fiml', group = "Sex")
+summary(fitT1_ULCS_group, fit.measures=TRUE, standardized=TRUE, rsquare=TRUE)
+
+
+```
+
+Re-run models where we specify the gender specific associations between brain age and depression to test whether the sex difference we observed in the first multi-group model is significant, do chi-squared test to confirm. 
+```{r Y1 constrain dBAG}
+
+# Compute latent change scores, handling missing values
+T1_ULCS_sex_diffs1 <-'
+
+T1_cBAG_2 ~ 1*T1_cBAG_1     # Fixed regression of T1_cBAG_2 on T1_cBAG_1
+dBAG_1 =~ 1*T1_cBAG_2       # Defines latent change score factors by fixed regression of dCOG1 on T1_cBAG_2
+T1_cBAG_2 ~ 0*1             # This constrains the intercept of T1_cBAG_2 to 0
+T1_cBAG_2 ~~ 0*T1_cBAG_2    # This fixes the variance of the T1_cBAG_2 to 0 
+
+dBAG_1 ~ 1                  # This estimates the intercept of the change scores 
+T1_cBAG_1 ~  1              # This estimates the intercept of T1_cBAG_1 
+dBAG_1 ~~  dBAG_1           # This estimates the variance of the change scores 
+T1_cBAG_1 ~~ T1_cBAG_1      # This estimates the variance of T1_cBAG_1 
+dBAG_1~~T1_cBAG_1           # This estimates the self-feedback parameter (how BAG_T1 affects dBAG)
+
+
+BPM_Y3 ~ 1                  # This estimates intercept of depression (outcome)
+BPM_6m ~ 1                  # This estimates intercept of early dep
+BPM_Y3 ~ c(a,a)*dBAG_1      # Here we constrain the coefficients across                                     sexes to test whether sex diff is significant 
+BPM_Y3 ~ BPM_6m             # regress early dep on depression
+BPM_Y3 ~ T1_cBAG_1          # regress BAG_T1 on depression
+
+BPM_Y3 ~~ BPM_Y3            # This estimates variance of depression
+BPM_6m ~~ BPM_6m            # This estimates the variance of early dep
+BPM_6m ~~ dBAG_1            # This est imates the variance of early dep and change in BAG
+BPM_6m ~~ T1_cBAG_1         # This estimates the variance of early dep and                                  T1_cBAG_1
+'
+
+#Multi-group with sex as grouping variable 
+fitT1_ULCS_sex_diffs1 <- lavaan(T1_ULCS_sex_diffs1, data=T1DFWide, estimator='mlr',fixed.x=FALSE, missing='fiml', group = "Sex")
+
+summary(fitT1_ULCS_sex_diffs1, fit.measures=TRUE, standardized=TRUE, rsquare=TRUE)
+
+#run chi-squared test to check whether sex difference is significant
+anova(fitT1_ULCS, fitT1_ULCS_sex_diffs1)
+
+```
+Let us also look constrain the parameters for the initial BAG across sexes to see if there is a significant sex difference. 
+
+```{r T1 constain initial BAG}
+
+T1_ULCS_sex_diffs2 <-'
+
+T1_cBAG_2 ~ 1*T1_cBAG_1     # Fixed regression of T1_cBAG_2 on T1_cBAG_1
+dBAG_1 =~ 1*T1_cBAG_2       # Defines latent change score factors by fixed regression of dCOG1 on T1_cBAG_2
+T1_cBAG_2 ~ 0*1             # This constrains the intercept of T1_cBAG_2 to 0
+T1_cBAG_2 ~~ 0*T1_cBAG_2    # This fixes the variance of the T1_cBAG_2 to 0 
+
+
+dBAG_1 ~ c(b,b)*1           # Constrain parameter to test sex difference
+T1_cBAG_1 ~  1              # This estimates the intercept of T1_cBAG_1 
+dBAG_1 ~~  dBAG_1           # This estimates the variance of the change scores 
+T1_cBAG_1 ~~ T1_cBAG_1      # This estimates the variance of T1_cBAG_1 
+dBAG_1~~T1_cBAG_1           # This estimates the self-feedback parameter (how BAG_T1 affects dBAG)
+
+
+BPM_Y3 ~ 1                  # This estimates intercept of depression (outcome)
+BPM_6m ~ 1                  # This estimates intercept of early dep
+BPM_Y3 ~ dBAG_1             # regress change score on depression
+BPM_Y3 ~ T1_cBAG_1          # regress T1_cBAG_1 on depression
+BPM_Y3 ~ BPM_6m             # regress early dep on depression
+
+BPM_Y3 ~~ BPM_Y3            # This estimates variance of depression
+BPM_6m ~~ BPM_6m            # This estimates the variance of early dep
+BPM_6m ~~ dBAG_1            # This estimates the variance of early dep and BAG change
+BPM_6m ~~ T1_cBAG_1         # Estimates the variance of early dep and T1_cBAG_1
+'
+
+#Multi-group with sex as grouping variable 
+fitT1_ULCS_sex_diffs2 <- lavaan(T1_ULCS_sex_diffs2, data=T1DFWide, estimator='mlr',fixed.x=FALSE, missing='fiml', group = "Sex")
+
+summary(fitT1_ULCS_sex_diffs2, fit.measures=TRUE, standardized=TRUE, rsquare=TRUE)
+
+#run chi-squared test to check whether sex difference is significant
+anova(fitT1_ULCS, fitT1_ULCS_sex_diffs2)
+
+```
+
+
+####DTI ULCS
+```{r DTI UCLS}
+
+DTI_ULCS <-'
+
+DTI_cBAG_2 ~ 1*DTI_cBAG_1     # Fixed regression of DTI_cBAG_2 on DTI_cBAG_1
+dBAG_1 =~ 1*DTI_cBAG_2     # Fixed regression of dCOG1 on DTI_cBAG_2
+DTI_cBAG_2 ~ 0*1          # This line constrains the intercept of DTI_cBAG_2 to 0
+DTI_cBAG_2 ~~ 0*DTI_cBAG_2    # This fixes the variance of the DTI_cBAG_2 to 0 
+
+dBAG_1 ~ 1             # This estimates the intercept of the change scores 
+DTI_cBAG_1 ~  1           # This estimates the intercept of DTI_cBAG_1 
+dBAG_1 ~~  dBAG_1       # This estimates the variance of the change scores 
+DTI_cBAG_1 ~~ DTI_cBAG_1    # This estimates the variance of DTI_cBAG_1 
+dBAG_1~~DTI_cBAG_1          # This estimates the self-feedback parameter
+
+BPM_Y3 ~ 1
+BPM_6m ~ 1 #also ran without, same error
+BPM_Y3 ~ dBAG_1 #change in BAG on depression, controlling for early dep
+BPM_Y3 ~ BPM_6m 
+BPM_Y3 ~ DTI_cBAG_1 
+
+BPM_Y3 ~~ BPM_Y3 #estimates variance of depression
+BPM_6m ~~ BPM_6m #variance of current and past symptoms (also ran without, but same error)
+BPM_6m ~~ dBAG_1 
+BPM_6m ~~ DTI_cBAG_1
+
+'
+
+#Multi-group with sex as grouping variable 
+fitDTI_ULCS <- lavaan(DTI_ULCS, data=DTIDFWide, estimator='mlr',fixed.x=FALSE, missing='fiml', group = "Sex")
+summary(fitDTI_ULCS, fit.measures=TRUE, standardized=TRUE, rsquare=TRUE)
+
+
+
+```
+
+
+Re-run DTI models with constraints on parameters of interest (dBAG) --- we are not expecting there to be a significant difference due to the non-significant effects in the main DTI model but doing for completeness. 
+
+
+```{r DTI constrain dBAG}
+
+DTI_ULCS_sex_diffs1 <-'
+
+DTI_cBAG_2 ~ 1*DTI_cBAG_1   # Fixed regression of DTI_cBAG_2 on DTI_cBAG_1
+dBAG_1 =~ 1*DTI_cBAG_2      # Fixed regression of dCOG1 on DTI_cBAG_2
+DTI_cBAG_2 ~ 0*1            # This line constrains the intercept of DTI_cBAG_2 to 0
+DTI_cBAG_2 ~~ 0*DTI_cBAG_2  # This fixes the variance of the DTI_cBAG_2 to 0 
+
+dBAG_1 ~ 1                  # This estimates the intercept of the change scores 
+DTI_cBAG_1 ~  1             # This estimates the intercept of DTI_cBAG_1 
+dBAG_1 ~~  dBAG_1           # This estimates the variance of the change scores 
+DTI_cBAG_1 ~~ DTI_cBAG_1    # This estimates the variance of DTI_cBAG_1 
+dBAG_1~~DTI_cBAG_1          # This estimates the self-feedback parameter
+
+BPM_Y3 ~ 1
+BPM_6m ~ 1 
+BPM_Y3 ~ c(a,a)* dBAG_1     #constain parameter to test for sex differences
+BPM_Y3 ~ BPM_6m 
+BPM_Y3 ~ DTI_cBAG_1 
+
+BPM_Y3 ~~ BPM_Y3            #estimates variance of depression
+BPM_6m ~~ BPM_6m            #variance of current and past symptoms
+BPM_6m ~~ dBAG_1 
+BPM_6m ~~ DTI_cBAG_1
+
+'
+
+#Multi-group with sex as grouping variable 
+fitDTI_ULCS_sex_diffs1 <- lavaan(DTI_ULCS_sex_diffs1, data=DTIDFWide, estimator='mlr',fixed.x=FALSE, missing='fiml', group = "Sex")
+
+summary(fitDTI_ULCS_sex_diffs1, fit.measures=TRUE, standardized=TRUE, rsquare=TRUE)
+
+#run chi-squared test to check whether the model fit is worse, as indicated by p<0.05, to see whether sex difference is significant. 
+anova(fitDTI_ULCS, fitDTI_ULCS_sex_diffs1)
+
+#Now constrain initial BAG parameter in model and compare model fit. 
+
+DTI_ULCS_sex_diffs2 <-'
+
+DTI_cBAG_2 ~ 1*DTI_cBAG_1   # Fixed regression of DTI_cBAG_2 on DTI_cBAG_1
+dBAG_1 =~ 1*DTI_cBAG_2      # Fixed regression of dCOG1 on DTI_cBAG_2
+DTI_cBAG_2 ~ 0*1            # This line constrains the intercept of DTI_cBAG_2 to 0
+DTI_cBAG_2 ~~ 0*DTI_cBAG_2  # This fixes the variance of the DTI_cBAG_2 to 0 
+
+dBAG_1 ~ c(a,a)*1           # This constains the intercept of the change scores 
+DTI_cBAG_1 ~  1             # This estimates the intercept of DTI_cBAG_1 
+dBAG_1 ~~  dBAG_1           # This estimates the variance of the change scores 
+DTI_cBAG_1 ~~ DTI_cBAG_1    # This estimates the variance of DTI_cBAG_1 
+dBAG_1~~DTI_cBAG_1          # This estimates the self-feedback parameter
+
+BPM_Y3 ~ 1
+BPM_6m ~ 1 
+BPM_Y3 ~ dBAG_1             
+BPM_Y3 ~ BPM_6m 
+BPM_Y3 ~ DTI_cBAG_1  #constain parameter to test for sex differences
+
+BPM_Y3 ~~ BPM_Y3            #estimates variance of depression
+BPM_6m ~~ BPM_6m            #variance of current and past symptoms
+BPM_6m ~~ dBAG_1 
+BPM_6m ~~ DTI_cBAG_1
+
+'
+
+#Multi-group with sex as grouping variable 
+fitDTI_ULCS_sex_diffs2 <- lavaan(DTI_ULCS_sex_diffs2, data=DTIDFWide, estimator='mlr',fixed.x=FALSE, missing='fiml', group = "Sex")
+
+summary(fitDTI_ULCS_sex_diffs2, fit.measures=TRUE, standardized=TRUE, rsquare=TRUE)
+
+#run chi-squared test to check whether the model fit is worse, as indicated by p<0.05, to see whether sex difference is significant. 
+anova(fitDTI_ULCS, fitDTI_ULCS_sex_diffs2)
+
+```
+
+
+
+####fMRI ULCS
+```{r fMRI UCLS}
+fMRI_ULCS <-'
+
+fMRI_cBAG_2 ~ 1*fMRI_cBAG_1     # Fixed regression of fMRI_cBAG_2 on fMRI_cBAG_1
+dBAG_1 =~ 1*fMRI_cBAG_2     # Fixed regression of dCOG1 on fMRI_cBAG_2
+fMRI_cBAG_2 ~ 0*1          # This line constrains the intercept of fMRI_cBAG_2 to 0
+fMRI_cBAG_2 ~~ 0*fMRI_cBAG_2    # This fixes the variance of the fMRI_cBAG_2 to 0 
+
+dBAG_1 ~ 1             # This estimates the intercept of the change scores 
+fMRI_cBAG_1 ~  1           # This estimates the intercept of fMRI_cBAG_1 
+dBAG_1 ~~  dBAG_1       # This estimates the variance of the change scores 
+fMRI_cBAG_1 ~~ fMRI_cBAG_1    # This estimates the variance of fMRI_cBAG_1 
+dBAG_1~~fMRI_cBAG_1          # This estimates the self-feedback parameter
+
+BPM_Y3 ~ 1
+BPM_6m ~ 1 #also ran without, same error
+BPM_Y3 ~ dBAG_1 #change in BAG on depression, controlling for early dep
+BPM_Y3 ~ BPM_6m 
+BPM_Y3 ~ fMRI_cBAG_1 
+
+BPM_Y3 ~~ BPM_Y3 #estimates variance of depression
+BPM_6m ~~ BPM_6m #variance of current and past symptoms (also ran without, but same error)
+BPM_6m ~~ dBAG_1 
+BPM_6m ~~ fMRI_cBAG_1
+'
+
+#Multi-group with sex as grouping variable 
+fitfMRI_ULCS <- lavaan(fMRI_ULCS, data=fMRIDFWide, estimator='mlr',fixed.x=FALSE, missing='fiml', group = "Sex")
+summary(fitfMRI_ULCS, fit.measures=TRUE, standardized=TRUE, rsquare=TRUE)
+```
+
+
+```{r fMRI UCLS}
+####Examine whether sex difference is significant
+
+fMRI_ULCS_sex_diffs1 <-'
+
+fMRI_cBAG_2 ~ 1*fMRI_cBAG_1   # Fixed regression of fMRI_cBAG_2 on BAG_1
+dBAG_1 =~ 1*fMRI_cBAG_2       # Fixed regression of dCOG1 on fMRI_cBAG_2
+fMRI_cBAG_2 ~ 0*1             # Constrains the intercept of fMRI_cBAG_2 to 0
+fMRI_cBAG_2 ~~ 0*fMRI_cBAG_2  # Fixes variance of the fMRI_cBAG_2 to 0 
+
+dBAG_1 ~ 1                    # Estimates the intercept of the change scores 
+fMRI_cBAG_1 ~  1              # Estimates intercept of fMRI_cBAG_1 
+dBAG_1 ~~  dBAG_1             # Estimates variance of the change scores 
+fMRI_cBAG_1 ~~ fMRI_cBAG_1    # Estimates the variance of fMRI_cBAG_1 
+dBAG_1~~fMRI_cBAG_1           # Estimates the self-feedback parameter
+
+BPM_Y3 ~ 1
+BPM_6m ~ 1 
+BPM_Y3 ~ c(a,a)*dBAG_1        #Constrains coefficients across sexes
+BPM_Y3 ~ BPM_6m 
+BPM_Y3 ~ fMRI_cBAG_1 
+
+BPM_Y3 ~~ BPM_Y3              # Estimates variance of depression
+BPM_6m ~~ BPM_6m              # Variance of current and past symptoms
+BPM_6m ~~ dBAG_1 
+BPM_6m ~~ fMRI_cBAG_1
+'
+
+#Multi-group with sex as grouping variable 
+fitfMRI_ULCS_sex_diffs1 <- lavaan(fMRI_ULCS_sex_diffs1, data=fMRIDFWide, estimator='mlr',fixed.x=FALSE, missing='fiml', group = "Sex")
+
+summary(fitfMRI_ULCS_sex_diffs1, fit.measures=TRUE, standardized=TRUE, rsquare=TRUE)
+
+
+#run chi-squared test to check whether the model fit is worse, as indicated by p<0.05, to see whether sex difference is significant. 
+anova(fitfMRI_ULCS, fitfMRI_ULCS_sex_diffs1) #significant difference
+```
+
+
+```{r fMRI UCLS}
+#contrain coefficients for initial BAG value
+
+fMRI_ULCS_sex_diffs2 <-'
+
+fMRI_cBAG_2 ~ 1*fMRI_cBAG_1   # Fixed regression of fMRI_cBAG_2 on BAG_1
+dBAG_1 =~ 1*fMRI_cBAG_2       # Fixed regression of dCOG1 on fMRI_cBAG_2
+fMRI_cBAG_2 ~ 0*1             # Constrains the intercept of fMRI_cBAG_2 to 0
+fMRI_cBAG_2 ~~ 0*fMRI_cBAG_2  # Fixes variance of the fMRI_cBAG_2 to 0 
+
+dBAG_1 ~ 1                    # Estimates the intercept of the change scores 
+fMRI_cBAG_1 ~  1              # Estimates intercept of fMRI_cBAG_1 
+dBAG_1 ~~  dBAG_1             # Estimates variance of the change scores 
+fMRI_cBAG_1 ~~ fMRI_cBAG_1    # Estimates the variance of fMRI_cBAG_1 
+dBAG_1~~fMRI_cBAG_1           # Estimates the self-feedback parameter
+
+BPM_Y3 ~ 1
+BPM_6m ~ 1 
+BPM_Y3 ~ dBAG_1        
+BPM_Y3 ~ BPM_6m 
+BPM_Y3 ~ c(b,b,)*fMRI_cBAG_1 #Constrains coefficients across sexes
+
+BPM_Y3 ~~ BPM_Y3              # Estimates variance of depression
+BPM_6m ~~ BPM_6m              # Variance of current and past symptoms
+BPM_6m ~~ dBAG_1 
+BPM_6m ~~ fMRI_cBAG_1
+'
+
+#Multi-group with sex as grouping variable 
+fitfMRI_ULCS_sex_diffs2 <- lavaan(fMRI_ULCS_sex_diffs2, data=fMRIDFWide, estimator='mlr',fixed.x=FALSE, missing='fiml', group = "Sex")
+summary(fitfMRI_ULCS_sex_diffs2, fit.measures=TRUE, standardized=TRUE, rsquare=TRUE)
+
+#run chi-squared test to check whether the model fit is worse, as indicated by p<0.05, to see whether sex difference is significant. 
+anova(fitfMRI_ULCS, fitfMRI_ULCS_sex_diffs2) #significant difference
+
+
+```
+
+###Run main mixed effects model
+
+To double check that we see the same regression relationships as in the LCSM, run the main models with youth self reported depression as an outcome and BAG as predicton
+```{r BPM outcome}
+
+#T1 brain age
+T1mod <- glmer(BPM_Y3 ~  T1_cBAG + Sex  + (1|ID), data = T1DF, family = poisson,
+          control = glmerControl(optimizer = "bobyqa"))
+summary(T1mod)
+
+
+#DTI brain age
+DTImod <- glmer(BPM_Y3 ~  DTI_cBAG + Sex  + (1|ID), data = DTIDF, family = poisson,
+          control = glmerControl(optimizer = "bobyqa"))
+summary(DTImod)
+
+
+#fMRI brain age
+fMRImod <- glmer(BPM_Y3 ~  fMRI_cBAG + Sex  + (1|ID), data = fMRIDF, family = poisson,
+          control = glmerControl(optimizer = "bobyqa"))
+summary(fMRImod)
+
+
+```
+
+##Plot results
+
+####BPM male vs female plots
+```{r plot BPM density plots, fig.width=14, fig.height=6}
+
+#given the the BPM scores are very similar for each brain age model, we want to make a combined master DF to use when plotting that will include participants that have MRI data for at least one modality.
+
+#reduce to vars of interest before merge
+
+#T1
+T1BPM <- T1DFWide %>% 
+  select(c("ID", "Sex", "BPM_Y3", "BPM_6m"))
+
+#DTI
+DTIBPM <- DTIDFWide %>% 
+  select(c("ID", "Sex", "BPM_Y3", "BPM_6m"))
+
+#fMRI
+fMRIBPM <- fMRIDFWide %>% 
+  select(c("ID", "Sex", "BPM_Y3", "BPM_6m"))
+
+#merge dataframes
+masterDF <- left_join(T1BPM, DTIBPM, by = c("ID", "Sex", "BPM_Y3", "BPM_6m"))
+masterDF <- left_join(masterDF, fMRIBPM, by = c("ID", "Sex", "BPM_Y3", "BPM_6m"))
+
+
+
+#make density plots 
+
+#first get means per group to add to plot 
+means <- masterDF %>%
+   filter(complete.cases(.)) %>% 
+  group_by(Sex) %>%
+  summarize(mean_value = mean(BPM_Y3))
+
+BPMPlot<- masterDF %>% 
+  filter(complete.cases(.)) %>% 
+                  ggplot(aes(x = BPM_Y3, fill = Sex)) +
+                  geom_density(alpha = 0.5, adjust = 3 ) + 
+                  labs(title = "Distribution of internalising symptoms for males and females at TP3",
+                       x = "Internalising symptoms",
+                       y = "Density",
+                       fill = "Sex") + 
+          geom_vline(data =means, aes(xintercept = mean_value, colour = Sex), linetype = "dashed", alpha = 1, size =1) +
+                    scale_fill_manual(values = c("#af8dc3", "#7fbf7b"),
+                                      labels = c("1" = "Males", "2" = "Females")) +
+                    scale_color_manual(values = c("#af8dc3", "#7fbf7b")) +
+                    theme_classic() +
+                    theme(legend.title = element_blank()) +
+                    theme(legend.text = element_text(size = 16)) +
+                    theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+                    theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+                    theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+                    theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+                    guides(color = "none") +
+                    theme(legend.key.size = unit(2, "lines"),
+                          legend.position = "right") 
+                                            
+BPMPlot
+
+#save
+ggsave("../figs/BPMPlot.png", BPMPlot, width = 14, height = 6, units = "in", dpi = 300)
+
+
+```
+
+####BAG change plots
+
+#####Make difference scores
+
+For viualisation purposes, calculate difference score between BAG at baseline and two-year follow-up
+
+```{r}
+
+#### T1
+# Compute latent change scores, handling missing values
+T1DFWide$diff_score <- T1DFWide$T1_cBAG_2 - T1DFWide$T1_cBAG_1
+
+# If there are missing values, replace them with NA
+T1DFWide$diff_score[is.na(T1DFWide$T1_cBAG_1) | is.na(T1DFWide$T1_cBAG_2)] <- NA
+
+#### DTI
+# Compute latent change scores, handling missing values
+DTIDFWide$diff_score <- DTIDFWide$DTI_cBAG_2 - DTIDFWide$DTI_cBAG_1
+
+# If there are missing values, replace them with NA
+DTIDFWide$diff_score[is.na(DTIDFWide$DTI_cBAG_1) | is.na(DTIDFWide$DTI_cBAG_2)] <- NA
+
+#### fMRI
+# Compute latent change scores, handling missing values
+fMRIDFWide$diff_score <- fMRIDFWide$fMRI_cBAG_2 - fMRIDFWide$fMRI_cBAG_1
+
+# If there are missing values, replace them with NA
+fMRIDFWide$diff_score[is.na(fMRIDFWide$fMRI_cBAG_1) | is.na(fMRIDFWide$fMRI_cBAG_2)] <- NA
+
+
+
+
+```
+
+
+Make figure that shows distribution of brain age at TP1 and TP2 based on depression quartiles. 
+
+We need to make the quartiles for males and females separately for each modality
+
+#####Density plots: BAG by BPM qrt
+
+######T1
+
+```{r T1 brain age and depression plot, fig.width=14, fig.height=10 }
+#calculate BPM quartiles 
+
+#first make male and female dataframes so that the quartiles are sex specific 
+
+####### females #######
+
+T1DFFemalesWide <- T1DFWide %>% 
+                  filter(Sex == 2)
+
+#make quartiles
+T1QuartilesFemales <- quantile(T1DFFemalesWide$BPM_Y3, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+#create grouping variable based on quartiles 
+T1DFFemalesWide$BPM_quartile <- cut(T1DFFemalesWide$BPM_Y3, 
+                        breaks = c(-Inf, T1QuartilesFemales, Inf), 
+                        labels = c("Q1", "Q2", "Q3", "Q4"), 
+                        include.lowest = TRUE)
+
+#filter out na.values
+T1DFFemalesWide <- T1DFFemalesWide %>% 
+            select(c(ID, BPM_Y3, BPM_quartile, T1_cBAG_1, T1_cBAG_2, diff_score)) %>% 
+            filter(complete.cases(.))
+
+# Define colors for quartile groups
+quartile_colors <- c("coral", "cornflowerblue")
+
+T1FemalesQ1Q4 <- T1DFFemalesWide  %>% 
+  filter(BPM_quartile %in% c("Q1", "Q4"))
+
+FemaleT1Mean <- T1FemalesQ1Q4 %>%
+  group_by(BPM_quartile) %>%
+  summarise(mean_change_score_f = mean(diff_score, na.rm = TRUE))
+
+
+# Create density plot with sex specific mean line
+
+#females
+T1PlotFemales <- T1FemalesQ1Q4 %>% 
+                  ggplot(aes(x = diff_score, fill = BPM_quartile)) +
+                  geom_density(alpha = 0.5) +
+                  geom_vline(data = FemaleT1Mean, aes(xintercept = mean_change_score_f, 
+                  colour = BPM_quartile), 
+                  linetype = "dashed", alpha = 1, size =1, show.legend = FALSE) +
+                  labs(title = "Females: T1-BAG change for lower and upper BPM quartiles",
+                       x = "Change in T1-BAG between TP1 and TP2",
+                       y = "Density",
+                       fill = "BPM Quartile") +
+                  scale_fill_manual(values = quartile_colors,) +
+                  scale_color_manual(values = quartile_colors) +
+                  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+
+T1PlotFemales
+
+####### Males ########
+
+T1DFMalesWide <- T1DFWide %>% 
+                  filter(Sex == 1)
+
+T1QuartilesMales <- quantile(T1DFMalesWide$BPM_Y3, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+#create grouping variable based on quartiles 
+T1DFMalesWide$BPM_quartile <- cut(T1DFMalesWide$BPM_Y3, 
+                        breaks = c(-Inf, T1QuartilesMales, Inf), 
+                        labels = c("Q1", "Q2", "Q3", "Q4"), 
+                        include.lowest = TRUE)
+
+#filter out na.values
+T1DFMalesWide <- T1DFMalesWide %>% 
+            select(c(ID, BPM_Y3, BPM_quartile, T1_cBAG_1, T1_cBAG_2, diff_score)) %>% 
+            filter(complete.cases(.))
+
+# Define colors for quartile groups
+quartile_colors <- c("coral", "cornflowerblue")
+
+T1MalesQ1Q4 <- T1DFMalesWide  %>% 
+  filter(BPM_quartile %in% c("Q1", "Q4"))
+
+MaleT1Mean <- T1MalesQ1Q4 %>%
+  group_by(BPM_quartile) %>%
+  summarise(mean_change_score_m = mean(diff_score, na.rm = TRUE))
+
+
+T1PlotMales <- T1MalesQ1Q4  %>% 
+                  ggplot(aes(x = diff_score, fill = BPM_quartile)) +
+                  geom_density(alpha = 0.5) +
+                  geom_vline(data = MaleT1Mean, aes(xintercept = mean_change_score_m, 
+                  colour = BPM_quartile), linetype = "dashed", alpha = 1, size =1, show.legend = FALSE) +
+                  labs(title = "Males: T1-BAG change for lower and upper BPM quartiles",
+                       x = "Change in T1-BAG between TP1 and TP2",
+                       y = "Density",
+                       fill = "BPM Quartile") +
+                  scale_fill_manual(values = quartile_colors) +
+                  scale_color_manual(values = quartile_colors) +
+                  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+
+
+T1PlotMales
+
+#Combine plots 
+library(gridExtra)
+
+T1_combined_plot <- grid.arrange(T1PlotFemales, T1PlotMales, ncol = 1, heights = c(1,1))
+
+#save
+ggsave("../figs/T1_BPM_density_plot.png", T1_combined_plot, width = 20, height = 8, units = "in", dpi = 300)
+```
+
+
+######DTI 
+```{r DTI plot, fig.width=14, fig.height=10}
+
+#first make male and female dataframes so that the quartiles are sex specific 
+
+####### females #######
+
+DTIDFFemalesWide <- DTIDFWide %>% 
+                  filter(Sex == 2)
+
+#calculate quartiles
+DTIQuartilesFemales <- quantile(DTIDFFemalesWide$BPM_Y3, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+#create grouping variable based on quartiles 
+DTIDFFemalesWide$BPM_quartile <- cut(DTIDFFemalesWide$BPM_Y3, 
+                        breaks = c(-Inf, DTIQuartilesFemales, Inf), 
+                        labels = c("Q1", "Q2", "Q3", "Q4"), 
+                        include.lowest = TRUE)
+
+#filter out na.values
+DTIDFFemalesWide <- DTIDFFemalesWide %>% 
+            select(c(ID, BPM_Y3, BPM_quartile, DTI_cBAG_1, DTI_cBAG_2, diff_score)) %>% 
+            filter(complete.cases(.))
+
+# Define colors for quartile groups
+quartile_colors <- c("cyan3", "chartreuse3")
+
+DTIFemalesQ1Q4 <- DTIDFFemalesWide  %>% 
+  filter(BPM_quartile %in% c("Q1", "Q4"))
+
+FemaleDTIMean <- DTIFemalesQ1Q4 %>%
+  group_by(BPM_quartile) %>%
+  summarise(mean_change_score_f = mean(diff_score, na.rm = TRUE))
+
+# Create density plot with sex specific mean line
+
+#females
+DTIPlotFemales <- DTIFemalesQ1Q4 %>% 
+                  ggplot(aes(x = diff_score, fill = BPM_quartile)) +
+                  geom_density(alpha = 0.5) +
+                  geom_vline(data = FemaleDTIMean, aes(xintercept = mean_change_score_f, 
+                  colour = BPM_quartile), linetype = "dashed", alpha = 1, size =1, show.legend = FALSE) +
+                  labs(title = "Females: DTI-BAG change for lower and upper BPM quartiles",
+                       x = "Change in DTI-BAG between TP1 and TP2",
+                       y = "Density",
+                       fill = "BPM Quartile") +
+                  scale_fill_manual(values = quartile_colors) +
+                  scale_color_manual(values = quartile_colors) +
+                  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+
+DTIPlotFemales
+
+########  Males ########
+DTIDFMalesWide <- DTIDFWide %>% 
+                  filter(Sex == 1)
+
+DTIQuartilesMales <- quantile(DTIDFMalesWide$BPM_Y3, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+#create grouping variable based on quartiles 
+DTIDFMalesWide$BPM_quartile <- cut(DTIDFMalesWide$BPM_Y3, 
+                        breaks = c(-Inf, DTIQuartilesMales, Inf), 
+                        labels = c("Q1", "Q2", "Q3", "Q4"), 
+                        include.lowest = TRUE)
+
+#filter out na.values
+DTIDFMalesWide <- DTIDFMalesWide %>% 
+            select(c(ID, BPM_Y3, BPM_quartile, DTI_cBAG_1, DTI_cBAG_2, diff_score)) %>% 
+            filter(complete.cases(.))
+
+# Define colors for quartile groups
+quartile_colors <- c("cyan3", "chartreuse3")
+
+DTIMalesQ1Q4 <- DTIDFMalesWide  %>% 
+  filter(BPM_quartile %in% c("Q1", "Q4"))
+
+MaleDTIMean <- DTIMalesQ1Q4 %>%
+  group_by(BPM_quartile) %>%
+  summarise(mean_change_score_m = mean(diff_score, na.rm = TRUE))
+
+
+DTIPlotMales <- DTIMalesQ1Q4 %>% 
+                  ggplot(aes(x = diff_score, fill = BPM_quartile)) +
+                  geom_density(alpha = 0.5) +
+                  geom_vline(data = MaleDTIMean, aes(xintercept = mean_change_score_m, 
+                  colour = BPM_quartile), linetype = "dashed", alpha = 1, size =1,  show.legend = FALSE) +
+                  labs(title = "Males: DTI BAG change for lower and upper BPM quartiles",
+                       x = "Change in DTI BAG between TP1 and TP2",
+                       y = "Density",
+                       fill = "BPM Quartile") +
+                  scale_fill_manual(values = quartile_colors) +
+                  scale_color_manual(values = quartile_colors) +
+                  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+
+DTIPlotMales
+
+#Combine plots 
+library(gridExtra)
+
+DTI_combined_plot <- grid.arrange(DTIPlotFemales, DTIPlotMales, ncol = 1, heights = c(1,1))
+
+
+#save
+ggsave("../figs/DTI_BPM_density_plot.png", DTI_combined_plot, width = 20, height = 8, units = "in", dpi = 300)
+
+
+```
+
+
+Make the same plot for the fMRI brain age model
+
+######fMRI
+```{r fmri plot, fig.width=14, fig.height=10}
+
+#first make male and female dataframes so that the quartiles are sex specific 
+
+####### females #######
+fMRIDFFemalesWide <- fMRIDFWide %>% 
+                  filter(Sex == 2)
+
+#calculate quartiles
+fMRIQuartilesFemales <- quantile(fMRIDFFemalesWide$BPM_Y3, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+#create grouping variable based on quartiles 
+fMRIDFFemalesWide$BPM_quartile <- cut(fMRIDFFemalesWide$BPM_Y3, 
+                        breaks = c(-Inf, fMRIQuartilesFemales, Inf), 
+                        labels = c("Q1", "Q2", "Q3", "Q4"), 
+                        include.lowest = TRUE)
+
+#filter out na.values
+fMRIDFFemalesWide <- fMRIDFFemalesWide %>% 
+            select(c(ID, BPM_Y3, BPM_quartile, fMRI_cBAG_1, fMRI_cBAG_2, diff_score)) %>% 
+            filter(complete.cases(.))
+
+# Define colors for quartile groups
+quartile_colors <- c("darkmagenta", "darkgreen")
+
+fMRIFemalesQ1Q4 <- fMRIDFFemalesWide  %>% 
+  filter(BPM_quartile %in% c("Q1", "Q4"))
+
+FemalefMRIMean <- fMRIFemalesQ1Q4 %>%
+  group_by(BPM_quartile) %>%
+  summarise(mean_change_score_f = mean(diff_score, na.rm = TRUE))
+
+
+# Create density plot with sex specific mean line
+
+#females
+fMRIPlotFemales <- fMRIFemalesQ1Q4 %>% 
+                  ggplot(aes(x = diff_score, fill = BPM_quartile)) +
+                  geom_density(alpha = 0.5) +
+                  geom_vline(data = FemalefMRIMean, aes(xintercept = mean_change_score_f, colour = BPM_quartile), 
+                  linetype = "dashed", size = 1, alpha = 1, show.legend = FALSE) +
+                  labs(title = "Females: fMRI-BAG change for lower and upper BPM quartiles",
+                       x = "Change in fMRI-BAG between TP1 and TP2",
+                       y = "Density",
+                       fill = "BPM Quartile") +
+                  scale_fill_manual(values = quartile_colors) +
+                  scale_color_manual(values = quartile_colors) +
+                  theme_minimal()  +
+  theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+
+fMRIPlotFemales
+
+####### Males ######
+
+
+########  Males ########
+fMRIDFMalesWide <- fMRIDFWide %>% 
+                  filter(Sex == 1)
+
+fMRIQuartilesMales <- quantile(fMRIDFMalesWide$BPM_Y3, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+#create grouping variable based on quartiles 
+fMRIDFMalesWide$BPM_quartile <- cut(fMRIDFMalesWide$BPM_Y3, 
+                        breaks = c(-Inf, fMRIQuartilesMales, Inf), 
+                        labels = c("Q1", "Q2", "Q3", "Q4"), 
+                        include.lowest = TRUE)
+
+#filter out na.values
+fMRIDFMalesWide <- fMRIDFMalesWide %>% 
+            select(c(ID, BPM_Y3, BPM_quartile, fMRI_cBAG_1, fMRI_cBAG_2, diff_score)) %>% 
+            filter(complete.cases(.))
+
+# Define colors for quartile groups
+quartile_colors <- c("darkmagenta", "darkgreen")
+
+fMRIMalesQ1Q4 <- fMRIDFMalesWide  %>% 
+  filter(BPM_quartile %in% c("Q1", "Q4"))
+
+MalefMRIMean <- fMRIMalesQ1Q4 %>%
+  group_by(BPM_quartile) %>%
+  summarise(mean_change_score_m = mean(diff_score, na.rm = TRUE))
+
+fMRIPlotMales <- fMRIMalesQ1Q4 %>% 
+                  ggplot(aes(x = diff_score, fill = BPM_quartile)) +
+                  geom_density(alpha = 0.5) +
+                  geom_vline(data = MalefMRIMean, aes(xintercept = mean_change_score_m, 
+                  colour = BPM_quartile), linetype = "dashed",  size = 1, alpha = 1, show.legend = FALSE) +
+                  labs(title = "Males: fMRI-BAG change for lower and upper BPM quartiles",
+                       x = "Change in fMRI-BAG between TP1 and TP2",
+                       y = "Density",
+                       fill = "BPM Quartile") +
+                  scale_fill_manual(values = quartile_colors) +
+                  scale_color_manual(values = quartile_colors) +
+                  theme_minimal()  +
+  theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+
+fMRIPlotMales
+
+#Combine plots 
+library(gridExtra)
+
+fMRI_combined_plot <- grid.arrange(fMRIPlotFemales, fMRIPlotMales, ncol = 1, heights = c(1,1))
+
+#save
+ggsave("../figs/fMRI_BPM_density_plot.png", fMRI_combined_plot, width = 20, height = 8, units = "in", dpi = 300)
+
+```
+
+#####Raincloud plots: BAG and Sex diffs
+######T1
+```{r T1 brain age and depression plot, fig.width=14, fig.height=10}
+#### rain cloud plots ####
+
+#visualise sex differences in BAG change over time
+
+#first plot males and females on same graph
+T1RainPlotSexDiff <- T1DF %>% 
+  ggplot(aes(x=TP, y=T1_cBAG, color= Sex, fill = Sex), alpha = .6) +
+  geom_rain(aes(fill = Sex, color = Sex, group = Sex), alpha = .4) +  # Map color aesthetic here
+  theme_classic() +
+  stat_summary(fun = mean, geom = "line", aes(group = Sex, color = Sex), alpha = 1, size =1) +
+  stat_summary(fun = mean, geom = "point", aes(group = Sex, fill = Sex), color = "white",
+               shape = 1, size = 1.5, stroke = .7, alpha =1) +
+  scale_fill_manual(values=c("#fec44f", "#7fcdbb"),
+                    labels = c("1" = "Males", "2" = "Females")) +
+  scale_color_manual(values= c("#fec44f", "#7fcdbb", "white")) +
+  labs(
+    title =  "Change in T1-BAG over time for males and females",
+    x = "Timepoint",
+    y = "T1w Brain Age Gap (BAG)",
+    group = "Sex") +
+  theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 24, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+  
+T1RainPlotSexDiff
+
+#save
+ggsave("../figs/T1_RainPlot_SexDiff.png", T1RainPlotSexDiff, width = 14, height = 10, units = "in", dpi = 300)
+
+```
+T1 Brain age change over time by BPM quartile. Plot males and females separately.
+
+We will need to derive the quartiles again here because the data is in 
+
+```{r T1 brain age and depression plot, fig.width=14, fig.height=10}
+
+#data needs to be in longformat so we will use original dataframe and recalculate quartiles for visualisation purposes
+#This needs to be done for males and females separately
+
+#make sure timepoint variable is a factor
+T1DFFemales$TP <- as.factor(T1DFFemales$TP)
+
+T1QuartilesFemalesLong <- quantile(T1DFFemales$BPM_Y3, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+#create grouping variable based on quartiles 
+T1DFFemales$BPM_quartile <- cut(T1DFFemales$BPM_Y3, 
+                        breaks = c(-Inf, T1QuartilesFemalesLong, Inf), 
+                        labels = c("Q1", "Q2", "Q3", "Q4"), 
+                        include.lowest = TRUE)
+
+#make new grouping variable a factor
+T1DFFemales$BPM_quartile <- as.factor(T1DFFemales$BPM_quartile)
+
+#females
+T1RainPlotFemalesBPM <- T1DFFemales %>% 
+  filter(BPM_quartile %in% c("Q1", "Q4")) %>% 
+  ggplot(aes(x=TP, y=T1_cBAG, color= BPM_quartile, fill = BPM_quartile), alpha = .6) +
+  geom_rain(aes(fill = BPM_quartile, color = BPM_quartile, group = BPM_quartile), alpha = .4) +  # Map color aesthetic here
+  theme_classic() +
+  stat_summary(fun = mean, geom = "line", aes(group = BPM_quartile, color = BPM_quartile), alpha = 1) +
+  stat_summary(fun = mean, geom = "point", aes(group = BPM_quartile, fill = BPM_quartile), color = "white",
+               shape = 1, size = 1.5, stroke = .7, alpha =1) +
+  scale_fill_manual(values=c("coral", "cornflowerblue")) +
+  scale_color_manual(values= c("coral", "cornflowerblue", "white")) +
+  labs(
+    title =  "Females: Change in T1-BAG over time for lower and higher BPM  quartiles",
+    x = "Timepoint",
+    y = "T1w Brain Age Gap (BAG)",
+    group = "BPM quartile") +
+theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+T1RainPlotFemalesBPM
+
+#save
+ggsave("../figs/T1_RainPlot_Females_BPM.png", T1RainPlotFemalesBPM, width = 16, height = 10, units = "in", dpi = 300)
+
+
+#males
+
+#make sure timepoint variable is a factor
+T1DFMales$TP <- as.factor(T1DFMales$TP)
+
+T1QuartilesMalesLong <- quantile(T1DFMales$BPM_Y3, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+#create grouping variable based on quartiles 
+T1DFMales$BPM_quartile <- cut(T1DFMales$BPM_Y3, 
+                        breaks = c(-Inf, T1QuartilesMalesLong, Inf), 
+                        labels = c("Q1", "Q2", "Q3", "Q4"), 
+                        include.lowest = TRUE)
+
+#make new grouping variable a factor
+T1DFMales$BPM_quartile <- as.factor(T1DFMales$BPM_quartile)
+
+#plot
+T1RainPlotMalesBPM <- T1DFMales %>% 
+  filter(BPM_quartile %in% c("Q1", "Q4")) %>% 
+  ggplot(aes(x=TP, y=T1_cBAG, color= BPM_quartile, fill = BPM_quartile), alpha = .6) +
+  geom_rain(aes(fill = BPM_quartile, color = BPM_quartile, group = BPM_quartile), alpha = .4) +  # Map color aesthetic here
+  theme_classic() +
+  stat_summary(fun = mean, geom = "line", aes(group = BPM_quartile, color = BPM_quartile), alpha = 1, size =1) +
+  stat_summary(fun = mean, geom = "point", aes(group = BPM_quartile, fill = BPM_quartile), color = "white",
+               shape = 1, size = 1.5, stroke = .7, alpha =1) +
+  scale_fill_manual(values=c("coral", "cornflowerblue")) +
+  scale_color_manual(values= c("coral", "cornflowerblue", "white")) +
+  labs(
+    title =  "Males: Change in T1-BAG over time for lower and higher BPM  quartiles",
+    x = "Timepoint",
+    y = "T1w Brain Age Gap (BAG)",
+    group = "BPM quartile") +
+theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+T1RainPlotMalesBPM
+
+#save
+ggsave("../figs/T1_RainPlot_Males_BPM.png", T1RainPlotMalesBPM, width = 16, height = 10, units = "in", dpi = 300)
+
+#combine plot
+T1RainCombinedBPM <- grid.arrange(T1RainPlotFemalesBPM, T1RainPlotMalesBPM, ncol = 1, heights = c(1,1))
+#save
+ggsave("../figs/T1_RainCombined_BPM.png", T1RainCombinedBPM, width = 16, height = 10, units = "in", dpi = 300)                                
+                                 
+```
+
+
+######DTI
+```{r DTI raincloud plot, fig.width=14, fig.height=10}
+
+#visualise sex differences in BAG change over time
+
+#first plot males and females on same graph
+DTIRainPlotSexDiff <- DTIDF %>% 
+  ggplot(aes(x=TP, y=DTI_cBAG, color= Sex, fill = Sex), alpha = .3) +
+  geom_rain(aes(fill = Sex, color = Sex, group = Sex), alpha = .3) +  # Map color aesthetic here
+  theme_classic() +
+  stat_summary(fun = mean, geom = "line", aes(group = Sex, color = Sex), alpha = 1, size =1) +
+  stat_summary(fun = mean, geom = "point", aes(group = Sex, fill = Sex), color = "white",
+               shape = 1, size = 1.5, stroke = .7, alpha =1) +
+  scale_fill_manual(values=c("cyan3", "chartreuse3"),
+                    labels = c("1" = "Males", "2" = "Females")) +
+  scale_color_manual(values= c("cyan3", "chartreuse3", "white")) +
+  labs(
+    title =  "Change in DTI-BAG over time for males and females",
+    x = "Timepoint",
+    y = "DTI Brain age gap (BAG)",
+    group = "Sex") +
+  theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 24, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+  
+DTIRainPlotSexDiff
+
+ggsave("../figs/DTI_RainPlot_SexDiff.png", DTIRainPlotSexDiff, width = 14, height = 10, units = "in", dpi = 300)
+
+
+
+```
+DTI Sex differences per BPM quartile
+
+```{r DTI brain age and depression plot, fig.width=14, fig.height=10}
+
+#data needs to be in longformat so we will use original dataframe and recalculate quartiles for visualisation purposes
+#This needs to be done for males and females separately
+
+##### females #####
+#make sure timepoint variable is a factor
+DTIDFFemales$TP <- as.factor(DTIDFFemales$TP)
+
+DTIQuartilesFemalesLong <- quantile(DTIDFFemales$BPM_Y3, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+#create grouping variable based on quartiles 
+DTIDFFemales$BPM_quartile <- cut(DTIDFFemales$BPM_Y3, 
+                        breaks = c(-Inf, DTIQuartilesFemalesLong, Inf), 
+                        labels = c("Q1", "Q2", "Q3", "Q4"), 
+                        include.lowest = TRUE)
+
+#make new grouping variable a factor
+DTIDFFemales$BPM_quartile <- as.factor(DTIDFFemales$BPM_quartile)
+  
+#females
+DTIRainPlotFemalesBPM <- DTIDFFemales %>% 
+  filter(BPM_quartile %in% c("Q1", "Q4")) %>% 
+  ggplot(aes(x=TP, y=DTI_cBAG, color= BPM_quartile, fill = BPM_quartile), alpha = .6) +
+  geom_rain(aes(fill = BPM_quartile, color = BPM_quartile, group = BPM_quartile), alpha = .4) +  # Map color aesthetic here
+  theme_classic() +
+  stat_summary(fun = mean, geom = "line", aes(group = BPM_quartile, color = BPM_quartile), alpha = 1, size =1) +
+  stat_summary(fun = mean, geom = "point", aes(group = BPM_quartile, fill = BPM_quartile), color = "white",
+               shape = 1, size = 1.5, stroke = .7, alpha =1) +
+  scale_fill_manual(values=c("cyan3", "chartreuse3")) +
+  scale_color_manual(values= c("cyan3", "chartreuse3", "white")) +
+  labs(
+    title =  "Females: Change in DTI-BAG over time for lower and higher BPM  quartiles",
+    x = "Timepoint",
+    y = "DTI Brain Age Gap (BAG)",
+    group = "BPM quartile") +
+theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+DTIRainPlotFemalesBPM
+
+#save
+ggsave("../figs/DTI_RainPlot_Females_BPM.png", DTIRainPlotFemalesBPM, width = 16, height = 10, units = "in", dpi = 300)
+
+
+####### males ######
+
+#make sure timepoint variable is a factor
+DTIDFMales$TP <- as.factor(DTIDFMales$TP)
+
+DTIQuartilesMalesLong <- quantile(DTIDFMales$BPM_Y3, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+#create grouping variable based on quartiles 
+DTIDFMales$BPM_quartile <- cut(DTIDFMales$BPM_Y3, 
+                        breaks = c(-Inf, DTIQuartilesMalesLong, Inf), 
+                        labels = c("Q1", "Q2", "Q3", "Q4"), 
+                        include.lowest = TRUE)
+
+#make new grouping variable a factor
+DTIDFMales$BPM_quartile <- as.factor(DTIDFMales$BPM_quartile)
+
+
+DTIRainPlotMalesBPM <- DTIDFMales %>% 
+  filter(BPM_quartile %in% c("Q1", "Q4")) %>% 
+  ggplot(aes(x=TP, y=DTI_cBAG, color= BPM_quartile, fill = BPM_quartile), alpha = .6) +
+  geom_rain(aes(fill = BPM_quartile, color = BPM_quartile, group = BPM_quartile), alpha = .4) +  # Map color aesthetic here
+  theme_classic() +
+  stat_summary(fun = mean, geom = "line", aes(group = BPM_quartile, color = BPM_quartile), alpha = 1, size =1) +
+  stat_summary(fun = mean, geom = "point", aes(group = BPM_quartile, fill = BPM_quartile), color = "white",
+               shape = 1, size = 1.5, stroke = .7, alpha =1) +
+  scale_fill_manual(values=c("cyan3", "chartreuse3")) +
+  scale_color_manual(values= c("cyan3", "chartreuse3", "white")) +
+  labs(
+    title =  "Males: Change in DTI-BAG over time for lower and higher BPM  quartiles",
+    x = "Timepoint",
+    y = "DTI Brain Age Gap (BAG)",
+    group = "BPM quartile") +
+theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+DTIRainPlotMalesBPM
+
+#save
+ggsave("../figs/DTI_RainPlot_Males_BPM.png", DTIRainPlotMalesBPM, width = 16, height = 10, units = "in", dpi = 300)
+
+
+#combine plot
+DTIRainCombinedBPM <- grid.arrange(DTIRainPlotFemalesBPM, DTIRainPlotMalesBPM, ncol = 1, heights = c(1,1))
+#save
+ggsave("../figs/DTI_RainCombined_BPM.png", DTIRainCombinedBPM, width = 16, height = 10, units = "in", dpi = 300) 
+
+
+```
+
+
+######fMRI
+```{r fMRI faincloud, fig.width=14, fig.height=10}
+
+#visualise sex differences in BAG change over time
+
+#first plot males and females on same graph
+fMRIRainPlotSexDiff <- fMRIDF %>% 
+  ggplot(aes(x=TP, y=fMRI_cBAG, color= Sex, fill = Sex), alpha = .3) +
+  geom_rain(aes(fill = Sex, color = Sex, group = Sex), alpha = .6) +  # Map color aesthetic here
+  theme_classic() +
+  stat_summary(fun = mean, geom = "line", aes(group = Sex, color = Sex), alpha = 1, size =1) +
+  stat_summary(fun = mean, geom = "point", aes(group = Sex, fill = Sex), color = "white",
+               shape = 1, size = 1.5, stroke = .7, alpha =1) +
+  scale_fill_manual(values=c("darkmagenta", "darkgreen"),
+                    labels = c("1" = "Males", "2" = "Females")) +
+  scale_color_manual(values= c("darkmagenta", "darkgreen", "white")) +
+  labs(
+    title =  "Change in fMRI-BAG over time for males and females",
+    x = "Timepoint",
+    y = "fMRI Brain Age Gap (BAG)",
+    group = "Sex") +
+  theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 24, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+  
+fMRIRainPlotSexDiff
+
+ggsave("../figs/fMRI_RainPlot_SexDiff.png", fMRIRainPlotSexDiff, width = 14, height = 10, units = "in", dpi = 300)
+
+```
+
+####fMRI Brain age change over time by BPM quartile
+
+```{r fMRI brain age and depression plot, fig.width=14, fig.height=10}
+
+#data needs to be in longformat so we will use original dataframe and recalculate quartiles for visualisation purposes
+#This needs to be done for males and females separately
+
+##### females #####
+#make sure timepoint variable is a factor
+fMRIDFFemales$TP <- as.factor(fMRIDFFemales$TP)
+
+fMRIQuartilesFemalesLong <- quantile(fMRIDFFemales$BPM_Y3, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+#create grouping variable based on quartiles 
+fMRIDFFemales$BPM_quartile <- cut(fMRIDFFemales$BPM_Y3, 
+                        breaks = c(-Inf, fMRIQuartilesFemalesLong, Inf), 
+                        labels = c("Q1", "Q2", "Q3", "Q4"), 
+                        include.lowest = TRUE)
+
+#make new grouping variable a factor
+fMRIDFFemales$BPM_quartile <- as.factor(fMRIDFFemales$BPM_quartile)
+  
+#plot
+fMRIRainPlotFemalesBPM <- fMRIDFFemales %>% 
+  filter(BPM_quartile %in% c("Q1", "Q4")) %>% 
+  ggplot(aes(x=TP, y=fMRI_cBAG, color= BPM_quartile, fill = BPM_quartile), alpha = .3) +
+  geom_rain(aes(fill = BPM_quartile, color = BPM_quartile, group = BPM_quartile), alpha = .6) +  # Map color aesthetic here
+  theme_classic() +
+  stat_summary(fun = mean, geom = "line", aes(group = BPM_quartile, color = BPM_quartile), alpha = 1, size =1) +
+  stat_summary(fun = mean, geom = "point", aes(group = BPM_quartile, fill = BPM_quartile), color = "white",
+               shape = 1, size = 1.5, stroke = .7, alpha =1) +
+  scale_fill_manual(values=c("darkmagenta", "darkgreen")) +
+  scale_color_manual(values= c("darkmagenta", "darkgreen", "white")) +
+  labs(
+    title =  "Females: Change in fMRI-BAG over time for lower and higher BPM  quartiles",
+    x = "Timepoint",
+    y = "fMRI Brain Age Gap (BAG)",
+    group = "BPM quartile") +
+theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+fMRIRainPlotFemalesBPM
+
+#save
+ggsave("../figs/fMRI_RainPlot_Females_BPM.png", fMRIRainPlotFemalesBPM, width = 16, height = 10, units = "in", dpi = 300)
+
+##### Males #####
+#make sure timepoint variable is a factor
+fMRIDFMales$TP <- as.factor(fMRIDFMales$TP)
+
+fMRIQuartilesMalesLong <- quantile(fMRIDFMales$BPM_Y3, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+#create grouping variable based on quartiles 
+fMRIDFMales$BPM_quartile <- cut(fMRIDFMales$BPM_Y3, 
+                        breaks = c(-Inf, fMRIQuartilesMalesLong, Inf), 
+                        labels = c("Q1", "Q2", "Q3", "Q4"), 
+                        include.lowest = TRUE)
+
+#make new grouping variable a factor
+fMRIDFMales$BPM_quartile <- as.factor(fMRIDFMales$BPM_quartile)
+
+#plot
+fMRIRainPlotMalesBPM <- fMRIDFMales %>% 
+  filter(BPM_quartile %in% c("Q1", "Q4")) %>% 
+  ggplot(aes(x=TP, y=fMRI_cBAG, color= BPM_quartile, fill = BPM_quartile), alpha = .3) +
+  geom_rain(aes(fill = BPM_quartile, color = BPM_quartile, group = BPM_quartile), alpha = .6) +  # Map color aesthetic here
+  theme_classic() +
+  stat_summary(fun = mean, geom = "line", aes(group = BPM_quartile, color = BPM_quartile), alpha = 1, size =1) +
+  stat_summary(fun = mean, geom = "point", aes(group = BPM_quartile, fill = BPM_quartile), color = "white",
+               shape = 1, size = 1.5, stroke = .7, alpha =1) +
+  scale_fill_manual(values=c("darkmagenta", "darkgreen")) +
+  scale_color_manual(values= c("darkmagenta", "darkgreen", "white")) +
+  labs(
+    title =  "Males: Change in fMRI-BAG over time for lower and higher BPM  quartiles",
+    x = "Timepoint",
+    y = "fMRI Brain Age Gap (BAG)",
+    group = "BPM quartile") +
+theme(legend.title = element_blank()) +
+  theme(legend.text = element_text(size = 16)) +
+  theme(axis.text.x = element_text(size = 16, hjust = 1)) +
+  theme(axis.text.y = element_text(size = 16, hjust = 1)) +
+  theme(axis.title = element_text(size = 16, hjust = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  guides(color = "none") +
+  theme(legend.key.size = unit(2, "lines"),
+        legend.position = "right") 
+fMRIRainPlotMalesBPM
+
+#save
+ggsave("../figs/fMRI_RainPlot_Males_BPM.png", fMRIRainPlotMalesBPM, width = 16, height = 10, units = "in", dpi = 300)
+
+
+#combine plot
+fMRIRainCombinedBPM <- grid.arrange(fMRIRainPlotFemalesBPM, fMRIRainPlotMalesBPM, ncol = 1, heights = c(1,1))
+#save
+ggsave("../figs/fMRI_RainCombined_BPM.png", fMRIRainCombinedBPM, width = 16, height = 10, units = "in", dpi = 300) 
+
+fMRIRainCombinedBPM
+
+```
+
+
+######## END OF SCRIPT ########
